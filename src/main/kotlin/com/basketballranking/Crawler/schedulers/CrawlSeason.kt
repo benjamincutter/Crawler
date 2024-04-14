@@ -8,13 +8,12 @@ import org.springframework.stereotype.Component
 import com.basketballranking.Crawler.scrapers.AllTeamsScraper
 import com.basketballranking.Crawler.scrapers.TeamScheduleScraper
 import com.basketballranking.Crawler.services.GamesService
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 
 @Component
 class CrawlSeason : CommandLineRunner {
-
-
-    @Autowired
-    lateinit var allTeamsScraper: AllTeamsScraper
 
     @Autowired
     lateinit var teamScheduleScraper: TeamScheduleScraper
@@ -28,17 +27,64 @@ class CrawlSeason : CommandLineRunner {
     // cut down on dupes
     val competitorNamesCaptured = mutableSetOf<String>()
 
+    // The 32 conferences that get bids to tournament
+    // ACC, MEAC,
+    val includedConferences = setOf(
+        "AAC",
+        "ACC",
+        "America East",
+        "ASUN",
+        "Atlantic 10",
+        "Big East",
+        "Big Sky",
+        "Big South",
+        "Big Ten",
+        "Big 12",
+        "Big West",
+        "CAA",
+        "CUSA",
+        "DI Independent",
+        "Horizon",
+        "Ivy League",
+        "MAC",
+        "MAAC",
+        "MEAC",
+        "Mountain West",
+        "NEC",
+        "OVC",
+        "Pac-12",
+        "Patriot",
+        "SEC",
+        "SoCon",
+        "Southland",
+        "SWAC",
+        "Summit League",
+        "WCC",
+        "WAC"
+    )
+    val missingConferences = mutableSetOf<String>()
+
     val logger = LoggerFactory.getLogger(CrawlSeason::class.java)
+
     override fun run(vararg args: String?) {
         logger.info("CrawlSeason is running")
         var csvIteration = 0
         seedTeamIds()
         val earliestSeason = "2023-24"
+        val batchSize = 2
         while(teamsToScrape.isNotEmpty()) {
             logger.info("Teams to scrape: ${teamsToScrape.size}.  Teams Completed ${completedTeams.size}")
-            val teamId = teamsToScrape.first()
-            teamsToScrape.remove(teamId)
-            runTeam(teamId, earliestSeason)
+            val teamIds = teamsToScrape.take(batchSize)
+            val jobList = mutableListOf<Job>()
+            for (teamId in teamIds) {
+                jobList.add(kotlinx.coroutines.GlobalScope.launch {
+                    runTeam(teamId, earliestSeason)
+                    teamsToScrape.remove(teamId)
+                })
+            }
+            runBlocking {
+                jobList.forEach { it.join() }
+            }
             if (completedTeams.size % 20 == 0) {
                 logger.info("Writing games to CSV")
                 val gamesService = GamesService(teamIdToNameMapper, csvIteration)
@@ -70,21 +116,28 @@ class CrawlSeason : CommandLineRunner {
         val allSeasons = teamScheduleScraper.getSeasons(teamId, earliestSeason)
         for (season in allSeasons.values) {
             logger.info("Conference: ${season.conference} for team $teamName")
-            teamScheduleScraper.scrapeSchedule(season)
-            for (game in season.games) {
-                if (competitorNamesCaptured.contains(game.competitorName)) {
-                    logger.info("Already captured competitor name ${game.competitorName}")
-                    continue
+
+            // don't scrape teams that aren't in the 32 conferences that get bids to tournament
+            if (includedConferences.contains(season.conference)) {
+                teamScheduleScraper.scrapeSchedule(season)
+                for (game in season.games) {
+                    if (competitorNamesCaptured.contains(game.competitorName)) {
+                        continue
+                    }
+                    if (teamId.toString() != game.homeTeamId && !teamIdToNameMapper.containsKey(game.homeTeamId)) {
+                        teamsToScrape.add(game.homeTeamId.toInt())
+                    }
+                    if (teamId.toString() != game.awayTeamId && !teamIdToNameMapper.containsKey(game.awayTeamId)) {
+                        teamsToScrape.add(game.awayTeamId.toInt())
+                    }
+                    competitorNamesCaptured.add(game.competitorName)
                 }
-                if (teamId.toString() != game.homeTeamId && !teamIdToNameMapper.containsKey(game.homeTeamId)) {
-                    teamsToScrape.add(game.homeTeamId.toInt())
-                }
-                if (teamId.toString() != game.awayTeamId && !teamIdToNameMapper.containsKey(game.awayTeamId)) {
-                    teamsToScrape.add(game.awayTeamId.toInt())
-                }
-                competitorNamesCaptured.add(game.competitorName)
+                curTeam.addSeason(season)
+            } else {
+                missingConferences.add(season.conference)
+                logger.info("Skipped conference ${season.conference}.  Current missing conferences: $missingConferences")
             }
-            curTeam.addSeason(season)
+
             if (teamsToScrape.contains(season.seasonId.toInt())) {
                 logger.info("Removing dupe season id ${season.seasonId} for team $teamName")
                 teamsToScrape.remove(season.seasonId.toInt())
