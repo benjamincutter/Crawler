@@ -20,10 +20,12 @@ repositories {
 
 dependencies {
 	implementation 'org.springframework.boot:spring-boot-starter'
+	implementation platform('software.amazon.awssdk:bom:2.25.31')
+	implementation 'software.amazon.awssdk:dynamodb-enhanced'
 	implementation 'org.jetbrains.kotlin:kotlin-reflect'
 	implementation 'org.jsoup:jsoup:1.17.2'
-	implementation'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1-Beta'
-	developmentOnly 'org.springframework.boot:spring-boot-devtools'
+	implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1-Beta'
+//	developmentOnly 'org.springframework.boot:spring-boot-devtools'
 	testImplementation 'org.springframework.boot:spring-boot-starter-test'
 }
 

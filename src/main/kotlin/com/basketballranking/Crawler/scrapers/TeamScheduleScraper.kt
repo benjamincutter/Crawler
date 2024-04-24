@@ -28,7 +28,7 @@ class TeamScheduleScraper() {
                 continue;
             }
             try {
-                season.addGame(parseGameRow(row, season.ncaaTeamId))
+                season.addGame(parseGameRow(row, season.ncaaTeamId, season.teamName))
             } catch (e: Exception) {
                 log.error("Error parsing game row: ${row.children().text()}")
             }
@@ -71,9 +71,10 @@ class TeamScheduleScraper() {
         return yearMap
     }
 
-    private fun parseGameRow(row: Element, teamId: Int): Game {
+    private fun parseGameRow(row: Element, teamId: Int, teamName: String): Game {
         val date = convertDateToTimestamp(row.children()[0].text())
         val isAway = row.children()[0].text().contains("@")
+        val rawText = row.text()
         var competitor = row.children()[1].text()
         if (competitor.contains("@")) {
             competitor = competitor.replace("@ ", "")
@@ -90,9 +91,9 @@ class TeamScheduleScraper() {
                 homeScore = 0,
                 awayScore = 0,
                 date = date,
-                contestId = "")
+                contestId = "",
+                gameText = rawText)
         }
-        val isWin = boxScore[0].contains("W")
         val score = boxScore[1].split("-")
         var contestId = ""
         try {
@@ -104,20 +105,24 @@ class TeamScheduleScraper() {
             return Game(
                 homeTeamId = competitorId,
                 awayTeamId = teamId.toString(),
+                awayTeamName = teamName,
                 competitorName = competitor,
                 homeScore = score[1].toInt(),
                 awayScore = score[0].toInt(),
                 date = date,
-                contestId = contestId)
+                contestId = contestId,
+                gameText = rawText)
         } else {
             return Game(
                 homeTeamId = teamId.toString(),
+                homeTeamName = teamName,
                 awayTeamId = competitorId,
                 competitorName = competitor,
                 homeScore = score[0].toInt(),
                 awayScore = score[1].toInt(),
                 date = date,
-                contestId = contestId)
+                contestId = contestId,
+                gameText = rawText)
 
         }
     }
@@ -129,7 +134,12 @@ class TeamScheduleScraper() {
     }
 
     private fun getTeamName(doc: Document): String {
-        return doc.getElementsByAttributeValue("target", "ATHLETICS_URL")[0].text()
+        try {
+            return doc.getElementsByAttributeValue("target", "ATHLETICS_URL")[0].text()
+        } catch (e: Exception) {
+            log.error("Error getting team name", doc.text())
+            return ""
+        }
     }
 
     private fun getConference(doc: Document, minYear: String): Map<String, TeamHistoryInfo> {

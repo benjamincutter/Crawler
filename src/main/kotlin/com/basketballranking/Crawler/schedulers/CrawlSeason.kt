@@ -1,12 +1,15 @@
 package com.basketballranking.Crawler.schedulers
 
+import com.basketballranking.Crawler.constants.INCLUDED_CONFERENCES
+import com.basketballranking.Crawler.constants.SEED_TEAMS
+import com.basketballranking.Crawler.models.Game
 import com.basketballranking.Crawler.models.Team
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.CommandLineRunner
 import org.springframework.stereotype.Component
-import com.basketballranking.Crawler.scrapers.AllTeamsScraper
 import com.basketballranking.Crawler.scrapers.TeamScheduleScraper
+import com.basketballranking.Crawler.services.DynamoTeamsService
 import com.basketballranking.Crawler.services.GamesService
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -18,60 +21,34 @@ class CrawlSeason : CommandLineRunner {
     @Autowired
     lateinit var teamScheduleScraper: TeamScheduleScraper
 
+    @Autowired
+    lateinit var dynamoDbTeamService: DynamoTeamsService
+
     val teamsToScrape = mutableSetOf<Int>()
     val completedTeams = mutableMapOf<String, Team>()
 
     // every season for a team has its own team id, so we need to map all ids to names
     val teamIdToNameMapper = mutableMapOf<String, String>()
 
+    val capturedTeamIds = mutableSetOf<String>()
+
     // cut down on dupes
     val competitorNamesCaptured = mutableSetOf<String>()
-
-    // The 32 conferences that get bids to tournament
-    // ACC, MEAC,
-    val includedConferences = setOf(
-        "AAC",
-        "ACC",
-        "America East",
-        "ASUN",
-        "Atlantic 10",
-        "Big East",
-        "Big Sky",
-        "Big South",
-        "Big Ten",
-        "Big 12",
-        "Big West",
-        "CAA",
-        "CUSA",
-        "DI Independent",
-        "Horizon",
-        "Ivy League",
-        "MAC",
-        "MAAC",
-        "MEAC",
-        "Mountain West",
-        "NEC",
-        "OVC",
-        "Pac-12",
-        "Patriot",
-        "SEC",
-        "SoCon",
-        "Southland",
-        "SWAC",
-        "Summit League",
-        "WCC",
-        "WAC"
-    )
     val missingConferences = mutableSetOf<String>()
 
-    val logger = LoggerFactory.getLogger(CrawlSeason::class.java)
+    private val logger = LoggerFactory.getLogger(CrawlSeason::class.java)
+    val earliestSeason = "2013-14"
 
+    /**
+     * Entrypoint for the crawler
+     */
     override fun run(vararg args: String?) {
         logger.info("CrawlSeason is running")
         var csvIteration = 0
         seedTeamIds()
-        val earliestSeason = "2023-24"
-        val batchSize = 2
+
+        // unfortunately, parellelism causes the site to block us
+        val batchSize = 1
         while(teamsToScrape.isNotEmpty()) {
             logger.info("Teams to scrape: ${teamsToScrape.size}.  Teams Completed ${completedTeams.size}")
             val teamIds = teamsToScrape.take(batchSize)
@@ -85,7 +62,7 @@ class CrawlSeason : CommandLineRunner {
             runBlocking {
                 jobList.forEach { it.join() }
             }
-            if (completedTeams.size % 20 == 0) {
+            if (completedTeams.size % 50 == 0) {
                 logger.info("Writing games to CSV")
                 val gamesService = GamesService(teamIdToNameMapper, csvIteration)
                 csvIteration++
@@ -98,7 +75,11 @@ class CrawlSeason : CommandLineRunner {
         logger.info("CrawlSeason is done")
     }
 
-    fun runTeam(teamId: Int, earliestSeason: String) {
+    /**
+     * Run the team for the given team id
+     */
+    suspend fun runTeam(teamId: Int, earliestSeason: String) {
+        val startTime = System.currentTimeMillis()
         var teamName = ""
         try {
             teamName = teamScheduleScraper.peakTeamName(teamId)
@@ -106,81 +87,110 @@ class CrawlSeason : CommandLineRunner {
             logger.error("Error getting team name for team id $teamId")
             return
         }
+//         val dynamoSavedSeasons = dynamoDbTeamService.getTeamSeasons(teamName)
 
         teamIdToNameMapper[teamId.toString()] = teamName
+        capturedTeamIds.add(teamId.toString())
         if (completedTeams.containsKey(teamName)) {
             logger.info("Team $teamName has already been scraped")
             return
         }
         val curTeam = Team(teamName, "")
+
+        // get season ids, these still need to be enriched
         val allSeasons = teamScheduleScraper.getSeasons(teamId, earliestSeason)
         for (season in allSeasons.values) {
             logger.info("Conference: ${season.conference} for team $teamName")
+            dynamoDbTeamService.addIdToTeamName(season.seasonId, teamName)
+//            if (dynamoSavedSeasons.any { it.seasonYear == season.year }) {
+//                logger.info("Skipping season ${season.seasonId} for team $teamName")
+//                continue
+//            }
 
             // don't scrape teams that aren't in the 32 conferences that get bids to tournament
-            if (includedConferences.contains(season.conference)) {
+            if (INCLUDED_CONFERENCES.contains(season.conference)) {
                 teamScheduleScraper.scrapeSchedule(season)
-                for (game in season.games) {
-                    if (competitorNamesCaptured.contains(game.competitorName)) {
-                        continue
-                    }
-                    if (teamId.toString() != game.homeTeamId && !teamIdToNameMapper.containsKey(game.homeTeamId)) {
-                        teamsToScrape.add(game.homeTeamId.toInt())
-                    }
-                    if (teamId.toString() != game.awayTeamId && !teamIdToNameMapper.containsKey(game.awayTeamId)) {
-                        teamsToScrape.add(game.awayTeamId.toInt())
-                    }
-                    competitorNamesCaptured.add(game.competitorName)
-                }
+                mapTeamNames(season.games)
+                recordNewTeamsToScrape(season.games, teamId.toString())
                 curTeam.addSeason(season)
+                dynamoDbTeamService.processSeason(season)
             } else {
                 missingConferences.add(season.conference)
                 logger.info("Skipped conference ${season.conference}.  Current missing conferences: $missingConferences")
             }
 
+            // remove any duplicate season ids that may have been added from other contests
             if (teamsToScrape.contains(season.seasonId.toInt())) {
-                logger.info("Removing dupe season id ${season.seasonId} for team $teamName")
                 teamsToScrape.remove(season.seasonId.toInt())
             }
         }
 
         completedTeams[teamName] = curTeam
+        logger.info("########### Scraped team $teamName in ${System.currentTimeMillis() - startTime} ms ###########")
+
     }
 
-    fun seedTeamIds() {
-        teamsToScrape.add(561220) // ACC    Virginia Cavaliers
-        teamsToScrape.add(560853) // MEAC   Coppin State Eagles
-        teamsToScrape.add(560709) // MAC Buffalo Bulls
-        teamsToScrape.add(560616) // ASUN   Kennesaw State Owls
-        teamsToScrape.add(560616) // MVC    Illinois State Redbirds
-        teamsToScrape.add(560691) // America East   Binghamton Bearcats
-        teamsToScrape.add(560691) // Mountain West  Air Force Falcons
-        teamsToScrape.add(560883) // American   East Carolina Pirates
-        teamsToScrape.add(560897) // Northeast  Fairleigh Dickinson Knights
-        teamsToScrape.add(560861) // Atalntic 10    Davidson Wildcats
-        teamsToScrape.add(560555) // Ohio Valley    Lindenwood Lions
-        teamsToScrape.add(560702) // Big 12 BYU Cougars
-        teamsToScrape.add(560669) // Pac-12 Arizona State Sun Devils
-        teamsToScrape.add(560696) // Patriot    Boston University Terriers
-        teamsToScrape.add(560851) // Big East   UConn Huskies
-        teamsToScrape.add(560658) // SEC    Alabama Crimson Tide
-        teamsToScrape.add(560785) // Big Sky    Montana Grizzlies
-        teamsToScrape.add(560685) // Big South  Charleston Southern Buccaneers
-        teamsToScrape.add(560654) // SWAC   Alabama A&M Bulldogs
-        teamsToScrape.add(560955) // Big Ten    Illinois Fighting Illini
-        teamsToScrape.add(561164) // Southern   Chattanooga Mocs
-        teamsToScrape.add(560712) // Big West   Cal Poly Mustangs
-        teamsToScrape.add(560943) // Southland  Houston Christian Huskies
-        teamsToScrape.add(560820) // Coastal    Campbell Fighting Camels
-        teamsToScrape.add(560820) // Summit League  Denver Pioneers
-        teamsToScrape.add(560980) // Sun Belt   Georgia State Panthers
-        teamsToScrape.add(560571) // Conference USA Florida Atlantic Owls
-        teamsToScrape.add(561249) // Horizon    Green Bay Phoenix
-        teamsToScrape.add(560649) // WAC    Abilene Christian Wildcats
-        teamsToScrape.add(560830) // independent    Chicago State Cougars
-        teamsToScrape.add(560926) // West Coast Gonzaga Bulldogs
-        teamsToScrape.add(560855) // Ivy    Cornell Big Red
-        teamsToScrape.add(560740) // MAAC   Marist Red Foxes
+    private fun mapTeamNames(games: List<Game>) {
+        for (game in games) {
+            if (game.awayTeamName.isEmpty()) {
+                game.awayTeamName = getTeamName(game.awayTeamId)
+            }
+            if (game.homeTeamName.isEmpty()) {
+                game.homeTeamName = getTeamName(game.homeTeamId)
+            }
+        }
     }
 
+    private fun getTeamName(teamId: String): String {
+        // try local cache
+        val teamName = teamIdToNameMapper[teamId]
+        if (teamName != null) {
+            return teamName
+        }
+        // try dynamo
+        val dynamoTeam = dynamoDbTeamService.getTeamName(teamId)
+        if (dynamoTeam.isNotEmpty()) {
+            teamIdToNameMapper[teamId] = dynamoTeam
+            return dynamoTeam
+        }
+        // map all relevant seasons.  this will be expensive at the beginning but will save time later
+        logger.warn("Couldn't find $teamId in local cache or dynamo.  Mapping all seasons")
+        val result = teamScheduleScraper.getSeasons(teamId.toInt(), earliestSeason)
+        if (result.isNotEmpty()) {
+            logger.info("Mapping team ${result[earliestSeason]?.teamName} with ${result.size} seasons")
+            for (season in result.values) {
+                dynamoDbTeamService.addIdToTeamName(season.seasonId, season.teamName)
+                teamIdToNameMapper[teamId] = season.teamName
+            }
+            return teamIdToNameMapper[teamId] ?: ""
+        }
+        return ""
+    }
+
+    /**
+     * Record the teams that need to be scraped for the next iteration
+     */
+    fun recordNewTeamsToScrape(games: List<Game>, teamId: String) {
+        for (game in games) {
+            if (competitorNamesCaptured.contains(game.competitorName)) {
+                continue
+            }
+            if (teamId != game.homeTeamId && !capturedTeamIds.contains(game.homeTeamId)) {
+                teamsToScrape.add(game.homeTeamId.toInt())
+            }
+            if (teamId != game.awayTeamId && !capturedTeamIds.contains(game.awayTeamId)) {
+                teamsToScrape.add(game.awayTeamId.toInt())
+            }
+            competitorNamesCaptured.add(game.competitorName)
+        }
+    }
+
+    /**
+     * Seed the teams to scrape with the teams that are in the tournament
+     */
+    private fun seedTeamIds() {
+        for (team in SEED_TEAMS) {
+            teamsToScrape.add(team)
+        }
+    }
 }

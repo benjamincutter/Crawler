@@ -2,14 +2,20 @@ package com.basketballranking.Crawler.models
 
 class Game(
         var homeTeamId: String,
+        var homeTeamName: String = "",
         var awayTeamId: String,
+        var awayTeamName: String = "",
         var competitorName: String,
         var homeScore: Int,
         var awayScore: Int,
         var date: Long,
         var neutralSite: Boolean = false,
-        var contestId: String = ""
+        var contestId: String = "",
+        var gameText: String = ""
     ) {
+
+
+
 
 
     fun isWin(teamId: String): Boolean {
